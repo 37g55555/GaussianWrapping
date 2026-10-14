@@ -13,7 +13,7 @@ sudo apt install -y colmap
 ### GaussianWrapping
 
 ```bash
-git clone --recurse-submodules https://github.com/diego1401/GaussianWrapping
+git clone --recurse-submodules https://github.com/37g55555/GaussianWrapping
 cd GaussianWrapping
 conda create -n gaussian_wrapping python=3.9 -y
 conda activate gaussian_wrapping
@@ -47,6 +47,17 @@ tools/blender/blender --version
 ```
 
 ## Run
+
+Assuming you stored the images of your project in the following structure:
+
+```bash
+/path/to/dataset/...
++── images
+│   +── image1.jpg
+│   +── image2.jpg
+│   +── ...
+│   +── imageN.jpg
+```
 
 ```bash
 cd GaussianWrapping
