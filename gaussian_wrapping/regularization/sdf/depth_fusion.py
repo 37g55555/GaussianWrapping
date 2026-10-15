@@ -541,7 +541,7 @@ def evaluate_mesh_occupancy(
         use_binary_opacity=True,
     )
     
-    mesh_rasterizer = MeshRasterizer(cameras=views)
+    mesh_rasterizer = MeshRasterizer(cameras=views, use_opengl=False)
     if use_scalable_renderer:
         mesh_renderer = ScalableMeshRenderer(mesh_rasterizer)
     else:
@@ -614,7 +614,7 @@ def evaluate_mesh_colors(
         initial_sdf_value=-1.1,
     )
     
-    mesh_rasterizer = MeshRasterizer(cameras=views)
+    mesh_rasterizer = MeshRasterizer(cameras=views, use_opengl=False)
     if use_scalable_renderer:
         mesh_renderer = ScalableMeshRenderer(mesh_rasterizer)
     else:
