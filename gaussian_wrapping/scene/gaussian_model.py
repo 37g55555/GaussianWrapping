@@ -1776,6 +1776,7 @@ class GaussianModel:
         grads_abs, grad_abs_threshold, 
         scene_extent, N=2,
         use_abs_grad:bool=True,
+        selection_mask=None,
     ):
         assert self.use_radegs_densification
         
@@ -1791,6 +1792,13 @@ class GaussianModel:
             selected_pts_mask = torch.logical_or(selected_pts_mask, selected_pts_mask_abs)
         selected_pts_mask = torch.logical_and(selected_pts_mask,
                                               torch.max(self.get_scaling, dim=1).values > self.percent_dense*scene_extent)
+
+        if selection_mask is not None:
+            allowed = torch.zeros_like(selected_pts_mask)
+            allowed[:selection_mask.shape[0]] = selection_mask
+            selected_pts_mask &= allowed
+            if not selected_pts_mask.any():
+                return
 
         stds = self.get_scaling[selected_pts_mask].repeat(N,1)
         means =torch.zeros((stds.size(0), 3),device="cuda")
@@ -1815,23 +1823,33 @@ class GaussianModel:
         else:
             new_gaussian_features = None
         
+        # Under a count budget, remove split parents before appending children.
+        # This avoids a temporary model count above the final cap.
+        if selection_mask is not None:
+            new_culling = self._culling[selected_pts_mask].repeat(N,1)
+            new_factor_culling = self.factor_culling[selected_pts_mask].repeat(N,1)
+            self.prune_points(selected_pts_mask)
+
         self.densification_postfix(
             new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation, 
             new_base_occupancy, new_occupancy_shift, new_gaussian_features
         )
         
-        new_culling = self._culling[selected_pts_mask].repeat(N,1)
+        if selection_mask is None:
+            new_culling = self._culling[selected_pts_mask].repeat(N,1)
+            new_factor_culling = self.factor_culling[selected_pts_mask].repeat(N,1)
         self._culling = torch.cat((self._culling, new_culling))
-        new_factor_culling = self.factor_culling[selected_pts_mask].repeat(N,1)
         self.factor_culling = torch.cat((self.factor_culling, new_factor_culling))      
 
-        prune_filter = torch.cat((selected_pts_mask, torch.zeros(N * selected_pts_mask.sum(), device="cuda", dtype=bool)))
-        self.prune_points(prune_filter)
+        if selection_mask is None:
+            prune_filter = torch.cat((selected_pts_mask, torch.zeros(N * selected_pts_mask.sum(), device="cuda", dtype=bool)))
+            self.prune_points(prune_filter)
         
     def densify_and_clone_radegs(
         self, grads, grad_threshold,  
         grads_abs, grad_abs_threshold, scene_extent,
         use_abs_grad:bool=True,
+        selection_mask=None,
     ):
         assert self.use_radegs_densification
         
@@ -1842,6 +1860,8 @@ class GaussianModel:
             selected_pts_mask = torch.logical_or(selected_pts_mask, selected_pts_mask_abs)
         selected_pts_mask = torch.logical_and(selected_pts_mask,
                                               torch.max(self.get_scaling, dim=1).values <= self.percent_dense*scene_extent)
+        if selection_mask is not None:
+            selected_pts_mask &= selection_mask
         
         new_xyz = self._xyz[selected_pts_mask]
         # sample a new gaussian instead of fixing position
@@ -1885,6 +1905,7 @@ class GaussianModel:
         self, max_grad, min_opacity, extent, max_screen_size,
         use_abs_grad:bool=True,
         viewpoint_cameras: List=None,
+        N_max_gaussians: Optional[int]=None,
     ):
         assert self.use_radegs_densification
         
@@ -1897,11 +1918,37 @@ class GaussianModel:
         Q = torch.quantile(grads_abs.reshape(-1), 1 - ratio)
         
         before = self._xyz.shape[0]
-        self.densify_and_clone_radegs(grads, max_grad, grads_abs, Q, extent, use_abs_grad=use_abs_grad)
-        clone = self._xyz.shape[0]
-
-        self.densify_and_split_radegs(grads, max_grad, grads_abs, Q, extent, use_abs_grad=use_abs_grad)
-        split = self._xyz.shape[0]
+        selected = None
+        if N_max_gaussians is not None:
+            if N_max_gaussians <= 0:
+                raise ValueError('N_max_gaussians must be positive.')
+            budget = max(0, N_max_gaussians-before)
+            normal_error = torch.norm(grads, dim=-1)
+            absolute_error = torch.norm(grads_abs, dim=-1)
+            eligible = normal_error >= max_grad
+            score = normal_error / max(max_grad, torch.finfo(grads.dtype).tiny)
+            if use_abs_grad:
+                eligible |= absolute_error >= Q
+                score = torch.maximum(score, absolute_error/Q.clamp_min(torch.finfo(grads.dtype).tiny))
+            candidates = eligible.nonzero(as_tuple=True)[0]
+            selected = torch.zeros_like(eligible)
+            if budget and len(candidates):
+                count = min(budget, len(candidates))
+                best = candidates[score[candidates].topk(count, sorted=False).indices]
+                selected[best] = True
+        if selected is not None and not selected.any():
+            # Continue opacity/size pruning at the cap, without reallocating the model.
+            for tensor in (self.xyz_gradient_accum, self.xyz_gradient_accum_abs,
+                           self.xyz_gradient_accum_abs_max, self.denom, self.max_radii2D):
+                tensor.zero_()
+            clone = split = before
+        else:
+            self.densify_and_clone_radegs(grads, max_grad, grads_abs, Q, extent,
+                                         use_abs_grad=use_abs_grad, selection_mask=selected)
+            clone = self._xyz.shape[0]
+            self.densify_and_split_radegs(grads, max_grad, grads_abs, Q, extent,
+                                         use_abs_grad=use_abs_grad, selection_mask=selected)
+            split = self._xyz.shape[0]
 
         if self.use_unbounded_opacity:
             assert viewpoint_cameras is not None

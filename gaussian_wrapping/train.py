@@ -111,6 +111,8 @@ def training(
     if checkpoint:
         (model_params, first_iter) = torch.load(checkpoint)
         gaussians.restore(model_params, opt)
+        if args.N_max_gaussians is not None and gaussians.get_xyz.shape[0] > args.N_max_gaussians:
+            print(f"[WARNING] Checkpoint has {gaussians.get_xyz.shape[0]} Gaussians, above cap {args.N_max_gaussians}. Growth is disabled until below the cap; existing points are not automatically reduced.")
         if args.use_normal_field:
             if first_iter > normal_field_config["start_iter"]:
                 normal_field_config["start_iter"] = first_iter + 1
@@ -547,6 +549,7 @@ def training(
                         opt.densify_grad_threshold, 0.05, scene.cameras_extent, size_threshold, 
                         use_abs_grad=args.use_abs_grad_for_densification,
                         viewpoint_cameras=scene.getTrainCameras().copy(),
+                        N_max_gaussians=args.N_max_gaussians,
                     )
                     gaussians_have_changed = True
                     if use_mip_filter:
@@ -763,7 +766,7 @@ if __name__ == "__main__":
     # > Inspired by Mini-Splatting2.
     # > Used for pruning, densification and Gaussian pivots selection.
     parser.add_argument("--N_max_gaussians", type=int, default=None,
-        help="Cap Gaussian count during Normal Field Densification. If the next densification would exceed this, only the highest-error Gaussians are added up to the cap. None = no limit.")
+        help="Cap Gaussian growth during initial and Normal Field densification. Highest-error candidates receive the available budget. Existing over-cap checkpoints are not automatically reduced. None = no limit.")
     parser.add_argument("--warn_until_iter", type=int, default=3000)
     parser.add_argument("--non_maximal_pruning_iterations", nargs="+", type=int, default=[])
     parser.add_argument("--use_max_size_threshold", action=BooleanOptionalAction, default=False)
@@ -813,6 +816,8 @@ if __name__ == "__main__":
     parser.add_argument("--wandb_name", type=str, default=None)
     
     args = parser.parse_args(sys.argv[1:])
+    if args.N_max_gaussians is not None and args.N_max_gaussians <= 0:
+        parser.error('--N_max_gaussians must be positive')
 
     args.save_iterations.append(args.iterations)
     if not -1 in args.test_iterations:
