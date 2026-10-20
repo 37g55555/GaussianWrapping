@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 
 import argparse
+import json
 import struct
 from pathlib import Path
 
 import numpy as np
 import open3d as o3d
-import trimesh
 from trimesh.intersections import slice_faces_plane
 
 
@@ -84,32 +84,37 @@ def camera_focus(colmap):
 def support_plane(vertices, focus, up, scale):
     delta = vertices-focus; h = delta@up
     radial = np.linalg.norm(delta-np.outer(h, up), axis=1)
-    points = vertices[(h < -scale*.005) & (h > -scale*.5) & (radial < scale*.45)]
-    if len(points) < 200:
-        raise ValueError('Insufficient support points below the camera focus.')
     rng = np.random.default_rng(44)
-    points = points[rng.choice(len(points), min(60000, len(points)), replace=False)]
     tolerance = scale*.0015
     candidates = []
-    o3d.utility.random.seed(44)
-    for _ in range(8):
+    for attempt, (radius, depth) in enumerate(((.45, .5), (.65, 1.0)), 1):
+        points = vertices[(h < -scale*.005) & (h > -scale*depth) & (radial < scale*radius)]
         if len(points) < 200:
+            continue
+        points = points[rng.choice(len(points), min(60000, len(points)), replace=False)]
+        print(f'[Support] search {attempt}/2: {len(points)} samples', flush=True)
+        o3d.utility.random.seed(44)
+        for _ in range(8):
+            if len(points) < 200:
+                break
+            cloud = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(points))
+            eq, ids = cloud.segment_plane(tolerance, 3, 1600)
+            normal = unit(np.asarray(eq[:3])); offset = float(eq[3])
+            if normal@up < 0:
+                normal, offset = -normal, -offset
+            height = float(normal@focus+offset)
+            if normal@up > .90 and tolerance < height < scale*depth and len(ids) >= 200:
+                patch = points[ids]; projected = patch-np.outer(patch@normal, normal)
+                span = np.linalg.norm(np.ptp(projected, axis=0))
+                if span > scale*.12:
+                    candidates.append((normal, offset, height, len(ids)))
+            mask = np.ones(len(points), bool); mask[ids] = False; points = points[mask]
+        if candidates:
             break
-        cloud = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(points))
-        eq, ids = cloud.segment_plane(tolerance, 3, 1600)
-        normal = unit(np.asarray(eq[:3])); offset = float(eq[3])
-        if normal@up < 0:
-            normal, offset = -normal, -offset
-        height = float(normal@focus+offset)
-        if normal@up > .90 and tolerance < height < scale*.5 and len(ids) >= 200:
-            # A support surface extends laterally beyond a tiny flat feature.
-            patch = points[ids]; projected = patch-np.outer(patch@normal, normal)
-            span = np.linalg.norm(np.ptp(projected, axis=0))
-            if span > scale*.12:
-                candidates.append((normal, offset, height, len(ids)))
-        mask = np.ones(len(points), bool); mask[ids] = False; points = points[mask]
+        if attempt == 1:
+            print('[Support] no plane nearby; expanding search below the focus.', flush=True)
     if not candidates:
-        raise ValueError('No substantial horizontal support plane found.')
+        raise ValueError('No substantial horizontal support plane found after expanding the search.')
     largest = max(c[3] for c in candidates)
     normal, offset, _, _ = min((c for c in candidates if c[3] >= largest*.2), key=lambda c:c[2])
     return normal, offset, tolerance
@@ -168,11 +173,16 @@ def main():
         raise ValueError('Input is not a triangle mesh.')
     v = np.asarray(source.vertices); f = np.asarray(source.triangles)
     normal, offset, tolerance = support_plane(v, focus, up, scale)
+    residual = abs(v@normal+offset)
+    residual = residual[residual < tolerance]
+    noise = max(float(np.percentile(residual, 90)) if len(residual) else tolerance, scale*1e-7)
+    support = {'plane': [*normal.tolist(), float(offset)], 'noise': noise}
     v, f = isolate(v, f, focus, normal, offset, scale, tolerance)
     output.parent.mkdir(parents=True, exist_ok=True)
     result = o3d.geometry.TriangleMesh(o3d.utility.Vector3dVector(v), o3d.utility.Vector3iVector(f.astype(np.int32)))
     if not o3d.io.write_triangle_mesh(str(output), result, write_vertex_normals=False):
         raise OSError('Failed to write output PLY.')
+    output.with_suffix('.support.json').write_text(json.dumps(support, indent=2))
     print('Saved:', output, flush=True)
 
 
